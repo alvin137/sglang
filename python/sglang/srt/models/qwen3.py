@@ -577,7 +577,6 @@ class Qwen3ForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            print(f"Loading weight: {name} with shape {loaded_weight.shape}")
             if "Embedding" in self.config.name_or_path:
                 name = add_prefix(name, "model")
             layer_id = get_layer_id(name)
@@ -593,7 +592,6 @@ class Qwen3ForCausalLM(nn.Module):
 
             # DFloat11 weight mapping
             if self.is_dfloat11 and self.is_df11_tensor_name(name):
-                print(f"Attaching DFloat11 buffer: {name} with shape {loaded_weight.shape}")
                 parts = name.split(".")
                 layer_id = int(parts[2])
                 key = parts[-1]
@@ -628,7 +626,6 @@ class Qwen3ForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                print(f"Loading stacked weight: {name} with shape {loaded_weight.shape}")
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
