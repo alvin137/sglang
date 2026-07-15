@@ -29,6 +29,12 @@ from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.utils import add_prefix, is_cuda
 
+import numpy as np
+
+import math
+from pathlib import Path
+from sglang.srt.kernels.dfloat11.decode import get_decode_kernel
+
 Qwen3Config = None
 
 logger = logging.getLogger(__name__)
@@ -51,6 +57,7 @@ class Qwen3Attention(nn.Module):
         attention_bias: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        is_dfloat11: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -120,6 +127,7 @@ class Qwen3Attention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
         self.alt_stream = alt_stream
+        self.is_dfloat11 = is_dfloat11
 
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
@@ -148,13 +156,25 @@ class Qwen3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        df11_q_weight: Optional[torch.Tensor] = None,
+        df11_k_weight: Optional[torch.Tensor] = None,
+        df11_v_weight: Optional[torch.Tensor] = None,
+        df11_o_weight: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        if df11_q_weight is not None:
+            qkv_weight = torch.cat([df11_q_weight, df11_k_weight, df11_v_weight], dim=0)
+            qkv = torch.nn.functional.linear(hidden_states, qkv_weight)
+        else:
+            qkv, _  = self.qkv_proj(hidden_states)
+            
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._apply_qk_norm(q, k)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
-        output, _ = self.o_proj(attn_output)
+        if df11_o_weight is not None:
+            output = torch.nn.functional.linear(attn_output, df11_o_weight)
+        else:
+            output, _ = self.o_proj(attn_output)
         return output
 
 
@@ -173,6 +193,7 @@ class Qwen3DecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         head_dim = getattr(config, "head_dim", None)
+        self.is_dfloat11 = hasattr(config, "dfloat11_config")
         self.self_attn = Qwen3Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -187,6 +208,7 @@ class Qwen3DecoderLayer(nn.Module):
             attention_bias=config.attention_bias,
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
+            is_dfloat11=self.is_dfloat11
         )
         self.mlp = Qwen3MLP(
             hidden_size=self.hidden_size,
@@ -211,6 +233,81 @@ class Qwen3DecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
         )
+        hidden_size = config.hidden_size
+        intermediate_size = config.intermediate_size
+        num_attention_heads = config.num_attention_heads
+        num_key_value_heads = getattr(config, "num_key_value_heads", num_attention_heads)
+        head_dim = getattr(config, "head_dim", hidden_size // num_attention_heads)
+
+        self.df11_weight_shapes = {
+            "mlp.down_proj": (hidden_size, intermediate_size),
+            "mlp.gate_proj": (intermediate_size, hidden_size),
+            "mlp.up_proj": (intermediate_size, hidden_size),
+
+            "self_attn.k_proj": (num_key_value_heads * head_dim, hidden_size),
+            "self_attn.o_proj": (hidden_size, num_attention_heads * head_dim),
+            "self_attn.q_proj": (num_attention_heads * head_dim, hidden_size),
+            "self_attn.v_proj": (num_key_value_heads * head_dim, hidden_size),
+        }
+
+    def decode(self):
+        decoded = {}
+
+        encoded_exponent = getattr(self, "df11_encoded_exponent")
+        sign_mantissa = getattr(self, "df11_sign_mantissa")
+        luts = getattr(self, "df11_luts")
+        gaps = getattr(self, "df11_gaps")
+        output_positions = getattr(self, "df11_output_positions")
+        split_positions = getattr(self, "df11_split_positions")
+        shared_mem_size = self.df11_shared_mem_size
+        n_luts = luts.shape[0]
+        n_elements = sign_mantissa.numel()
+        n_bytes = encoded_exponent.numel()
+        threads_per_block = (512,  )
+        bytes_per_thread = 8
+        blocks_per_grid = (int(np.ceil(n_bytes / (threads_per_block[0] * bytes_per_thread))), )
+
+        if not luts.is_cuda:
+            target_device = torch.device("cuda")
+            luts = luts.to(target_device)
+            encoded_exponent = encoded_exponent.to(target_device)
+            sign_mantissa = sign_mantissa.to(target_device)
+            output_positions = output_positions.to(target_device)
+            gaps = gaps.to(target_device)
+        device = luts.device
+        output = torch.empty(n_elements, dtype = torch.bfloat16, device=device)
+        decode_kernel = get_decode_kernel()
+        import cupy as cp
+        torch_stream = torch.cuda.current_stream(device)
+        with cp.cuda.Device(device.index):
+            with cp.cuda.ExternalStream(torch_stream.cuda_stream):
+                decode_kernel(
+                    grid=blocks_per_grid,
+                    block=threads_per_block,
+                    shared_mem=shared_mem_size,
+                    args=[
+                        luts.data_ptr(),
+                        encoded_exponent.data_ptr(),
+                        sign_mantissa.data_ptr(),
+                        output_positions.data_ptr(),
+                        gaps.data_ptr(),
+                        output.data_ptr(),
+                        n_luts,
+                        n_bytes,
+                        n_elements,
+                    ],
+                )
+
+        pieces = torch.tensor_split(output, split_positions.tolist())
+        return {
+            "mlp.down_proj": pieces[0].reshape(self.df11_weight_shapes["mlp.down_proj"]),
+            "mlp.gate_proj": pieces[1].reshape(self.df11_weight_shapes["mlp.gate_proj"]),
+            "mlp.up_proj": pieces[2].reshape(self.df11_weight_shapes["mlp.up_proj"]),
+            "self_attn.k_proj": pieces[3].reshape(self.df11_weight_shapes["self_attn.k_proj"]),
+            "self_attn.o_proj": pieces[4].reshape(self.df11_weight_shapes["self_attn.o_proj"]),
+            "self_attn.q_proj": pieces[5].reshape(self.df11_weight_shapes["self_attn.q_proj"]),
+            "self_attn.v_proj": pieces[6].reshape(self.df11_weight_shapes["self_attn.v_proj"]),
+        }
 
     def forward(
         self,
@@ -219,6 +316,20 @@ class Qwen3DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        decoded = None
+        # Testing
+        if self.is_dfloat11:
+            decoded = self.decode() #TODO
+            down_w = decoded["mlp.down_proj"]
+            gate_w = decoded["mlp.gate_proj"]
+            up_w = decoded["mlp.up_proj"]
+            k_w = decoded["self_attn.k_proj"]
+            o_w = decoded["self_attn.o_proj"]
+            q_w = decoded["self_attn.q_proj"]
+            v_w = decoded["self_attn.v_proj"]
+        else:
+            down_w = gate_w = up_w = None
+            k_w = o_w = q_w = v_w = None
         # Self Attention
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
@@ -228,13 +339,22 @@ class Qwen3DecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+                df11_q_weight=q_w,
+                df11_k_weight=k_w,
+                df11_v_weight=v_w,
+                df11_o_weight=o_w,
             )
 
         # Fully Connected
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(
+            hidden_states,
+            df11_gate_weight=gate_w,
+            df11_down_weight=down_w,
+            df11_up_weight=up_w,
+        )
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
@@ -291,6 +411,7 @@ class Qwen3ForCausalLM(nn.Module):
         self.model = Qwen3Model(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
+        self.is_dfloat11 = hasattr(config, "dfloat11_config")
 
         # handle the lm head on different pp ranks
         if self.pp_group.is_last_rank:
@@ -414,19 +535,49 @@ class Qwen3ForCausalLM(nn.Module):
     @property
     def end_layer(self):
         return self.model.end_layer
+    DF11_KEYS = {
+    "encoded_exponent",
+    "sign_mantissa",
+    "luts",
+    "gaps",
+    "output_positions",
+    "split_positions",
+    }
+
+    def is_df11_tensor_name(self, name: str) -> bool:
+        return name.split(".")[-1] in self.DF11_KEYS
+
+    def attach_df11_buffer(self, layer, key: str, tensor: torch.Tensor):
+        buffer_name = f"df11_{key}"
+        if hasattr(layer, buffer_name):
+            delattr(layer, buffer_name)  
+
+        if key == "output_positions":
+            output_positions_np = tensor.view(torch.uint32).numpy()
+            threads_per_block = (512,  )
+            shared_mem_size = threads_per_block[0] * 4 + 4 + (output_positions_np[1:] - output_positions_np[:-1]).max().item() * 2
+            layer.df11_shared_mem_size = shared_mem_size
+
+        if key != "split_positions":
+            tensor = tensor.to(torch.device("cuda"))
+        layer.register_buffer(buffer_name, tensor, persistent=True)
+        
+
+
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
+                # (param_name, shard_name, shard_id)
+                ("qkv_proj", "q_proj", "q"),
+                ("qkv_proj", "k_proj", "k"),
+                ("qkv_proj", "v_proj", "v"),
+                ("gate_up_proj", "gate_proj", 0),
+                ("gate_up_proj", "up_proj", 1),
         ]
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            print(f"Loading weight: {name} with shape {loaded_weight.shape}")
             if "Embedding" in self.config.name_or_path:
                 name = add_prefix(name, "model")
             layer_id = get_layer_id(name)
@@ -438,6 +589,17 @@ class Qwen3ForCausalLM(nn.Module):
                     or layer_id >= self.model.end_layer
                 )
             ):
+                continue
+
+            # DFloat11 weight mapping
+            if self.is_dfloat11 and self.is_df11_tensor_name(name):
+                print(f"Attaching DFloat11 buffer: {name} with shape {loaded_weight.shape}")
+                parts = name.split(".")
+                layer_id = int(parts[2])
+                key = parts[-1]
+
+                layer = self.model.layers[layer_id]
+                self.attach_df11_buffer(layer, key, loaded_weight)
                 continue
 
             if "rotary_emb.inv_freq" in name or "projector" in name:
@@ -466,6 +628,7 @@ class Qwen3ForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+                print(f"Loading stacked weight: {name} with shape {loaded_weight.shape}")
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)

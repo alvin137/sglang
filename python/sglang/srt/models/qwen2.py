@@ -65,6 +65,7 @@ class Qwen2MLP(nn.Module):
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        is_dfloat11: bool = False,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -87,11 +88,22 @@ class Qwen2MLP(nn.Module):
                 "Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        self.is_dfloat11 = is_dfloat11
 
-    def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
+    def forward(self, x,
+                df11_gate_weight: Optional[torch.Tensor] = None,
+                df11_up_weight: Optional[torch.Tensor] = None,
+                df11_down_weight: Optional[torch.Tensor] = None):
+        if df11_gate_weight is not None:
+            gate_up_weight = torch.cat([df11_gate_weight, df11_up_weight], dim=0)
+            gate_up = torch.nn.functional.linear(x, gate_up_weight)
+        else:
+            gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        if df11_down_weight is not None:
+            x = torch.nn.functional.linear(x, df11_down_weight)
+        else:
+            x, _ = self.down_proj(x)
         return x
 
 
