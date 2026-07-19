@@ -26,6 +26,9 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.distributed.communication_op import (
+    tensor_model_parallel_all_reduce,
+)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -68,20 +71,24 @@ class Qwen2MLP(nn.Module):
         is_dfloat11: bool = False,
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("gate_up_proj", prefix),
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("down_proj", prefix),
-        )
+        if is_dfloat11:
+            self.gate_up_proj = None
+            self.down_proj = None
+        else:
+            self.gate_up_proj = MergedColumnParallelLinear(
+                hidden_size,
+                [intermediate_size] * 2,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("gate_up_proj", prefix),
+            )
+            self.down_proj = RowParallelLinear(
+                intermediate_size,
+                hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("down_proj", prefix),
+            )
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. "
@@ -89,6 +96,7 @@ class Qwen2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
         self.is_dfloat11 = is_dfloat11
+        self.tp_size = get_tensor_model_parallel_world_size()
 
     def forward(self, x,
                 df11_gate_weight: Optional[torch.Tensor] = None,
@@ -102,6 +110,11 @@ class Qwen2MLP(nn.Module):
         x = self.act_fn(gate_up)
         if df11_down_weight is not None:
             x = torch.nn.functional.linear(x, df11_down_weight)
+            # RowParallelLinear reduces the partial outputs from each TP rank.
+            # The DFloat11 path bypasses that layer, so it must do the same
+            # reduction explicitly.
+            if self.tp_size > 1:
+                x = tensor_model_parallel_all_reduce(x)
         else:
             x, _ = self.down_proj(x)
         return x

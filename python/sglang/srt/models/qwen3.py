@@ -65,6 +65,8 @@ class Qwen3Attention(nn.Module):
         self.total_num_heads = num_heads
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
+        self.attn_tp_rank = attn_tp_rank
+        self.attn_tp_size = attn_tp_size
 
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
@@ -88,28 +90,31 @@ class Qwen3Attention(nn.Module):
 
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=attention_bias,
-            quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-            prefix=add_prefix("qkv_proj", prefix),
-        )
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            hidden_size,
-            bias=attention_bias,
-            quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-            reduce_results=False,
-            prefix=add_prefix("o_proj", prefix),
-        )
+        if is_dfloat11:
+            self.qkv_proj = None
+            self.o_proj = None
+        else:
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=attention_bias,
+                quant_config=quant_config,
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
+                prefix=add_prefix("qkv_proj", prefix),
+            )
+            self.o_proj = RowParallelLinear(
+                self.total_num_heads * self.head_dim,
+                hidden_size,
+                bias=attention_bias,
+                quant_config=quant_config,
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
+                reduce_results=False,
+                prefix=add_prefix("o_proj", prefix),
+            )
 
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -216,6 +221,7 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
+            is_dfloat11=self.is_dfloat11
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -327,6 +333,46 @@ class Qwen3DecoderLayer(nn.Module):
             o_w = decoded["self_attn.o_proj"]
             q_w = decoded["self_attn.q_proj"]
             v_w = decoded["self_attn.v_proj"]
+
+            # DFloat11 stores and decodes the original, unsharded weights.
+            # Match QKVParallelLinear/MergedColumnParallelLinear/
+            # RowParallelLinear by selecting this rank's shard before GEMM.
+            attn_rank = self.self_attn.attn_tp_rank
+            attn_size = self.self_attn.attn_tp_size
+            q_shard_size = self.self_attn.q_size
+            kv_shard_size = self.self_attn.kv_size
+
+            q_w = q_w.narrow(0, attn_rank * q_shard_size, q_shard_size)
+
+            total_kv_heads = self.self_attn.total_num_kv_heads
+            if total_kv_heads >= attn_size:
+                kv_shard_rank = attn_rank
+            else:
+                # QKVParallelLinear replicates KV heads when there are fewer
+                # KV heads than TP ranks.
+                kv_replicas = attn_size // total_kv_heads
+                kv_shard_rank = attn_rank // kv_replicas
+            kv_start = kv_shard_rank * kv_shard_size
+            k_w = k_w.narrow(0, kv_start, kv_shard_size)
+            v_w = v_w.narrow(0, kv_start, kv_shard_size)
+
+            # o_proj is row-parallel: each rank consumes its local attention
+            # heads, so shard the input (column) dimension of the weight.
+            o_w = o_w.narrow(1, attn_rank * q_shard_size, q_shard_size)
+
+            mlp_rank = get_tensor_model_parallel_rank()
+            mlp_size = get_tensor_model_parallel_world_size()
+            intermediate_size = gate_w.shape[0]
+            if intermediate_size % mlp_size != 0:
+                raise ValueError(
+                    f"DFloat11 MLP intermediate size {intermediate_size} is not "
+                    f"divisible by TP size {mlp_size}."
+                )
+            mlp_shard_size = intermediate_size // mlp_size
+            mlp_start = mlp_rank * mlp_shard_size
+            gate_w = gate_w.narrow(0, mlp_start, mlp_shard_size)
+            up_w = up_w.narrow(0, mlp_start, mlp_shard_size)
+            down_w = down_w.narrow(1, mlp_start, mlp_shard_size)
         else:
             down_w = gate_w = up_w = None
             k_w = o_w = q_w = v_w = None
@@ -563,9 +609,42 @@ class Qwen3ForCausalLM(nn.Module):
         layer.register_buffer(buffer_name, tensor, persistent=True)
         
 
+    def dump_large_tensors(self, model, path="/tmp/df11_after_load.txt", threshold_mb=1):
+        lines = []
 
+        param_total = 0
+        buffer_total = 0
+
+        lines.append("=== PARAMETERS ===")
+        for name, p in model.named_parameters():
+            mb = p.numel() * p.element_size() / 1024**2
+            param_total += p.numel() * p.element_size()
+            if mb >= threshold_mb:
+                lines.append(
+                    f"{name} shape={tuple(p.shape)} dtype={p.dtype} "
+                    f"device={p.device} MB={mb:.2f}"
+                )
+
+        lines.append("=== BUFFERS ===")
+        for name, b in model.named_buffers():
+            mb = b.numel() * b.element_size() / 1024**2
+            buffer_total += b.numel() * b.element_size()
+            if mb >= threshold_mb:
+                lines.append(
+                    f"{name} shape={tuple(b.shape)} dtype={b.dtype} "
+                    f"device={b.device} MB={mb:.2f}"
+                )
+
+        lines.append(f"PARAM TOTAL MB: {param_total / 1024**2:.2f}")
+        lines.append(f"BUFFER TOTAL MB: {buffer_total / 1024**2:.2f}")
+        lines.append(f"TOTAL MB: {(param_total + buffer_total) / 1024**2:.2f}")
+
+        with open(path, "w") as f:
+            f.write("\n".join(lines))
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        #self.dump_large_tensors(self.model, "/nfs/home/hhmoon/tmp/df11_before_load.txt")
+
         stacked_params_mapping = [
                 # (param_name, shard_name, shard_id)
                 ("qkv_proj", "q_proj", "q"),
@@ -643,6 +722,8 @@ class Qwen3ForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
+        print(f"Used Memory after loading weights: {torch.cuda.memory_allocated() / 1e6:.2f} MB")
+        #self.dump_large_tensors(self.model, "/nfs/home/hhmoon/tmp/df11_after_load.txt")
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
